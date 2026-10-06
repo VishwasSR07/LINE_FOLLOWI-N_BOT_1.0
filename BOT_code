@@ -1,0 +1,267 @@
+/*
+ * File name: PID_LF_example_ESP32
+ * * Hardware requirements: ESP32 Development Board
+ * QTR-8A Reflectance Sensor Array (Analog)
+ * TB6612FNG Dual Motor Driver 
+ * * Description: The basic PID control system implemented with 
+ * the line follower with the specified hardware. 
+ * The robot can follow a black line on a white surface 
+ * (or vice versa). 
+ * * Author: Bot Reboot (Modified for ESP32/TB6612FNG)
+ */
+
+#include <QTRSensors.h> //Make sure to install the library
+
+/*************************************************************************
+* Sensor Array object initialisation 
+*************************************************************************/
+QTRSensors qtr;
+const uint8_t SensorCount = 8;
+uint16_t sensorValues[SensorCount];
+
+// FIX: sensor pins in a global array. GPIO12 replaced with GPIO13 because
+// GPIO12 is a boot strapping pin on the ESP32.
+const uint8_t sensorPins[SensorCount] = {34, 35, 36, 39, 26, 27, 14, 13};
+
+/*************************************************************************
+* PID control system variables 
+*************************************************************************/
+float Kp = 0.08; // FIX: was 1 (far too high, saturated the motors)
+                 //change the value by trial-and-error (ex: 0.07).
+float Ki = 0;    //related to the integral control term; 
+                 //change the value by trial-and-error (ex: 0.0008).
+float Kd = 0.9;  // FIX: was 0 (derivative term damps the wobble)
+                 //change the value by trial-and-error (ex: 0.6).
+int P;
+int I;
+int D;
+
+/*************************************************************************
+* Global variables
+*************************************************************************/
+int lastError = 0;
+boolean onoff = false;
+
+// FIX: steering direction. If the robot steers AWAY from the line,
+// change this from -1 to 1 (or the other way round).
+const int steerDir = -1;
+
+// FIX: set to true to print the line position in Serial Monitor (115200)
+const bool DEBUG = false;
+
+/*************************************************************************
+* Motor speed variables (choose between 0 - no speed, and 255 - maximum speed)
+*************************************************************************/
+const uint8_t maxspeeda = 170; // FIX: lowered for testing
+const uint8_t maxspeedb = 170;
+const uint8_t basespeeda = 120;
+const uint8_t basespeedb = 120;
+
+/*************************************************************************
+* TB6612FNG GPIO pins declaration (ESP32)
+*************************************************************************/
+// Left Motor (Channel A)
+const int AIN1 = 21;
+const int AIN2 = 22;
+const int PWMA = 23;
+
+// Right Motor (Channel B)
+const int BIN1 = 25;
+const int BIN2 = 33;
+const int PWMB = 32;
+
+// Standby Pin
+const int STBY = 19;
+
+/*************************************************************************
+* Buttons and LED pins declaration (ESP32)
+*************************************************************************/
+const int buttoncalibrate = 15; 
+const int buttonstart = 4;
+const int ledPin = 2; // Built-in LED on most ESP32 boards
+
+/*************************************************************************
+* FIX: PWM setup for ESP32 (analogWrite is not available on core 2.x).
+* Works on both core 2.x and 3.x.
+*************************************************************************/
+const int pwmFreq = 20000; // 20 kHz
+const int pwmRes  = 8;     // 8-bit -> 0-255
+const int pwmChA  = 0;     // used only on core 2.x
+const int pwmChB  = 1;     // used only on core 2.x
+
+void pwmSetup() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcAttach(PWMA, pwmFreq, pwmRes);
+  ledcAttach(PWMB, pwmFreq, pwmRes);
+#else
+  ledcSetup(pwmChA, pwmFreq, pwmRes);
+  ledcSetup(pwmChB, pwmFreq, pwmRes);
+  ledcAttachPin(PWMA, pwmChA);
+  ledcAttachPin(PWMB, pwmChB);
+#endif
+}
+
+void pwmWrite(int pin, int duty) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcWrite(pin, duty);
+#else
+  ledcWrite((pin == PWMA) ? pwmChA : pwmChB, duty);
+#endif
+}
+
+/*************************************************************************
+* Function Name: setup
+**************************************************************************
+* Summary:
+* This is the setup function for the Arduino board. It first sets up the 
+* pins for the sensor array and the motor driver. Then the user needs to 
+* slide the sensors across the line for 10 seconds as they need to be 
+* calibrated. 
+*************************************************************************/
+void setup() {
+  Serial.begin(115200); // FIX: for debugging
+
+  qtr.setTypeAnalog(); // Changed to Analog for QTR-8A
+  qtr.setSensorPins(sensorPins, SensorCount);
+
+  // Motor Driver Pins
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  pwmSetup(); // FIX: PWMA / PWMB configured here instead of pinMode()
+  
+  // Bring driver out of standby
+  digitalWrite(STBY, HIGH); 
+
+  pinMode(ledPin, OUTPUT);
+  
+  // Set up buttons with internal pull-ups
+  pinMode(buttoncalibrate, INPUT_PULLUP);
+  pinMode(buttonstart, INPUT_PULLUP);
+
+  delay(500);
+
+  boolean Ok = false;
+  while (Ok == false) { // the main function won't start until the robot is calibrated
+    // Trigger on LOW since the button connects to GND
+    if(digitalRead(buttoncalibrate) == LOW) {
+      calibration(); //calibrate the robot for 10 seconds
+      Ok = true;
+    }
+  }
+  forward_brake(0, 0); //stop the motors
+}
+
+/*************************************************************************
+* Function Name: calibration
+**************************************************************************
+* Summary:
+* This is the calibration function for the QTR-8A Reflectance Sensor Array. 
+* While the LED is ON, slide the sensors left and right across the line
+* so every sensor sees both black and white.
+*************************************************************************/
+void calibration() {
+  digitalWrite(ledPin, HIGH);
+  for (uint16_t i = 0; i < 400; i++)
+  {
+    qtr.calibrate();
+    delay(25); // FIX: 400 x 25 ms = 10 s
+  }
+  digitalWrite(ledPin, LOW);
+}
+
+/*************************************************************************
+* Function Name: loop
+**************************************************************************
+* Summary:
+* This is the main function of this application. When the start button is
+* pressed, the robot will toggle between following the track and stopping.
+*************************************************************************/
+void loop() {
+  // Trigger on LOW since the button connects to GND
+  if(digitalRead(buttonstart) == LOW) {
+    onoff = !onoff;
+    while (digitalRead(buttonstart) == LOW) { delay(10); } // FIX: toggle only once per press
+    if(onoff == true) {
+      I = 0;         // FIX: reset PID memory on every start
+      lastError = 0;
+      delay(1000); //a delay when the robot starts
+    }
+    else {
+      delay(50);
+    }
+  }
+  if (onoff == true) {
+    PID_control();
+  }
+  else {
+    forward_brake(0,0); //stop the motors
+  }
+}
+
+/*************************************************************************
+* Function Name: forward_brake
+**************************************************************************
+* Summary:
+* This is the control interface function of the TB6612FNG motor driver.
+* AIN1/AIN2 and BIN1/BIN2 control the direction, while PWM controls speed.
+* * A warning though, depending on the motor wiring, you might need to 
+* swap AIN1/AIN2 or BIN1/BIN2 from HIGH/LOW to LOW/HIGH, in order for 
+* the robot to spin forward. 
+*************************************************************************/
+void forward_brake(int posa, int posb) {
+  // Set Left Motor to move forward
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  
+  // Set Right Motor to move forward
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  
+  // Write speeds
+  pwmWrite(PWMA, posa); // FIX: was analogWrite()
+  pwmWrite(PWMB, posb); // FIX: was analogWrite()
+}
+
+/*************************************************************************
+* Function Name: PID_control
+**************************************************************************
+* Summary: 
+* This is the function of the PID control system. 
+*************************************************************************/
+void PID_control() {
+  uint16_t position = qtr.readLineBlack(sensorValues); //read the current position
+  // For a white line on a dark surface use: qtr.readLineWhite(sensorValues)
+
+  if (DEBUG) Serial.println(position);
+
+  int error = 3500 - position; //3500 is the ideal position (the centre)
+
+  P = error;
+  I = I + error;
+  I = constrain(I, -10000, 10000); // FIX: stops the integral growing without limit
+  D = error - lastError;
+  lastError = error;
+  int motorspeed = P*Kp + I*Ki + D*Kd; //calculate the correction
+                                       //needed to be applied to the speed
+  
+  // FIX: steerDir sets the correct steering direction for your robot
+  int motorspeeda = basespeeda + steerDir * motorspeed;
+  int motorspeedb = basespeedb - steerDir * motorspeed;
+  
+  if (motorspeeda > maxspeeda) {
+    motorspeeda = maxspeeda;
+  }
+  if (motorspeedb > maxspeedb) {
+    motorspeedb = maxspeedb;
+  }
+  if (motorspeeda < 0) {
+    motorspeeda = 0;
+  }
+  if (motorspeedb < 0) {
+    motorspeedb = 0;
+  } 
+  forward_brake(motorspeeda, motorspeedb);
+}
